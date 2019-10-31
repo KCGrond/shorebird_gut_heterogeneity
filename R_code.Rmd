@@ -1,0 +1,548 @@
+---
+title: "DADA2_shorebird_guts"
+author: "Kirsten Grond"
+date: "10/17/2018"
+output: html_document
+---
+setwd("/Volumes/BIOResearch/Kirsten/Shorebird_guts")
+
+```{r DADA2}
+library(dada2); packageVersion("dada2")
+
+setwd("/Volumes/BIOResearch/Kirsten/Shorebird_guts")
+path <- "/Volumes/BIOResearch/Kirsten/Shorebird_guts/sequences" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq*", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq*", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+
+plotQualityProfile(fnFs[1:2]) # visualizing the quality profiles of the forward reads
+plotQualityProfile(fnRs[1:2]) # visualizing the quality profiles of the reverse reads
+
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out
+errF <- learnErrors(filtFs, multithread=TRUE) # estimate error rates in forward sequences
+errR <- learnErrors(filtRs, multithread=TRUE) # estimate error rates in reverse sequences
+
+#plotErrors(errF, nominalQ=TRUE) # visualize estimated error rates
+
+# dereplicate filtered fastq files
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE) #Infer the sequence variants in each sample
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+#merge denoised forward and reverse reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#construct sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#Remove chimeric sequences:
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+#Track sequences through pipeline. See if there is one step that loses too many reads. 
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+taxa <- assignTaxonomy(seqtab.nochim, "/Volumes/BIOResearch/Kirsten/Shorebird_guts/sequences/filtered/silva_nr_v128_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "/Volumes/BIOResearch/Kirsten/Shorebird_guts/sequences/filtered/silva_species_assignment_v128.fa.gz")
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+```{r tree build}
+setwd("/Volumes/BIOResearch/Kirsten/Shorebird_guts/")
+library(doParallel); packageVersion("doParallel")
+library(foreach); packageVersion("foreach")
+library(DECIPHER)
+library(phangorn)
+#Create multiple denovo alignment
+seqs <- getSequences(taxa)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+
+#construct a neighbor-joining tree, and then fit a Generalized time-reversible with Gamma rate variation
+#maximum likelihood tree using the neighbor-joining tree as a starting point.
+phangAlign <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phangAlign)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                    rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+```
+
+```{r make phyloseq object}
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+
+setwd("/Volumes/BIOResearch/Kirsten/Shorebird_guts")
+
+#read in metadata
+metadata = read.table(file="metadata_full.csv", sep=",", header=TRUE, row.names = c(1))
+
+
+#construct phyloseq object
+ps_gut <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa),phy_tree(fitGTR$tree))
+#remove non-target
+ps_gut <- ps_gut %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Class   != "Chloroplast"
+  )
+
+#remove positive control
+ps_gut <- prune_samples(sample_names(ps_gut) != "RID468Zymo" , ps_gut)
+```
+
+```{r Decontam}
+library(decontam)
+
+sample_data(ps_gut)$is.neg <- sample_data(ps_gut)$Sample_or_control == "control"
+contamdf.prev <- isContaminant(ps_gut, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+
+ps_gut.neg <- prune_samples(sample_data(ps_gut)$Sample_or_control == "control", ps_gut)
+ps_gut.neg.presence <- transform_sample_counts(ps_gut.neg, function(abund) 1*(abund>0))
+ps_gut.pos <- prune_samples(sample_data(ps_gut)$Sample_or_control == "sample", ps_gut)
+ps_gut.pos.presence <- transform_sample_counts(ps_gut.pos, function(abund) 1*(abund>0))
+
+df.pres <- data.frame(prevalence.pos=taxa_sums(ps_gut.pos.presence), prevalence.neg=taxa_sums(ps_gut.neg.presence),
+                      contam.prev=contamdf.prev$contaminant)
+
+write.csv(df.pres, file='contaminants.csv')
+
+#remove contaminants from phyloseq. Make sure to only select sequences that belong to controls!
+BadTaxa<- c("TACGAAGGGGGCTAGCGTTGCTCGGAATCACTGGGCGTAAAGGGTGCGTAGGCGGGTCTTTAAGTCAGGGGTGAAATCCTGGAGCTCAACTCCAGAACTGCCTTTGATACTGAAGATCTTGAGTTCGGGAGAGGTGAGTGGAACTGCGAGTGTAGAGGTGAAATTCGTAGATATTCGCAAGAACACCAGTGGCGAAGGCGGCTCACTGGCCCGATACTGACGCTGAGGCACGAAAGCGTGGGGAGCAAACAGG","TACAGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGTGGTTAGTTAAGTTGGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATTCAAAACTGACTGACTAGAGTATGGTAGAGGGTGGTGGAATTTCCTGTGTAGCGGTGAAATGCGTAGATATAGGAAGGAACACCAGTGGCGAAGGCGACCACCTGGACTGATACTGACACTGAGGTGCGAAAGCGTGGGGAGCAAACAGG","TACGGAGGATGCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGAGCGCAGACGGGGGGTTAAGTCAGCTGTGAAAGTTTGCGGCTCAACCGTAAAATTGCAGTTGATACTGGCCCTCTTGAGTGCAGTTGAGGTAGGCGGAATTCGTGGTGTAGCGGTGAAATGCTTAGATATCACGAAGAACTCCGATTGCGAAGGCAGCTTACTAAACTGTAACTGACGTTCATGCTCGAAAGTGTGGGTATCAAACAGG","TACGTAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGTGCGCAGGCGGTTATGCAAGACAGAGGTGAAATCCCCGGGCTCAACCTGGGAACTGCCTTTGTGACTGCATGGCTAGAGTACGGTAGAGGGGGATGGAATTCCGCGTGTAGCAGTGAAATGCGTAGATATGCGGAGGAACACCGATGGCGAAGGCAATCCCCTGGACCTGTACTGACGCTCATGCACGAAAGCGTGGGGAGCAAACAGG")
+
+allTaxa = taxa_names(ps_gut)
+allTaxa <- allTaxa[!(allTaxa %in% BadTaxa)]
+ps_gut = prune_taxa(allTaxa, ps_gut)
+ps_gut
+
+
+```
+
+```{r clean up phyloseq object}
+# Remove negative controls
+ps_gut <- prune_samples(sample_names(ps_gut) != "NEG2B10" , ps_gut) 
+ps_gut <- prune_samples(sample_names(ps_gut) != "NEG1A10"  , ps_gut) 
+ps_gut <- prune_samples(sample_names(ps_gut) != "RID457Blank" , ps_gut)
+ps_gut <- prune_samples(sample_names(ps_gut) != "RID457Blank2" , ps_gut) 
+```
+
+```{r rarefaction for richness and bar plots}
+ps_gut_rarefied = rarefy_even_depth(ps_gut)
+```
+
+
+```{r Richness}
+mytheme <- theme(axis.line = element_line(colour = "black"),
+                 panel.background = element_rect(fill = "white"))
+
+richness<- estimate_richness(ps_gut_rarefied, split = TRUE, measures = NULL)
+metadata_richness = read.table(file="richness.csv", sep=",", header=TRUE, row.names = c(1))
+
+###export richness file
+richness <- data.frame(richness, sample_data(ps_gut)) #combine richness with sample data
+write.csv(richness, file = "richness.csv")
+richness = read.table(file="richness.csv", sep=",", header=TRUE, row.names = c(1))
+
+###create dunling only and sesa only richness dataframes
+dunl <- richness[ which(richness$Species=='Dunlin'), ]
+sesa <- richness[ which(richness$Species=='Semipalmated Sandpiper'), ]
+
+###plot dunlin only
+Shannon_plot_dunl <- ggplot(dunl, aes(x=GI.Section, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("E","P","G","S","C","L")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("GIT Section")+ylab("Shannon Diversity Index") + ggtitle("Dunlin")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),
+axis.title.y = element_text(size=14))
+
+
+###plot sesa only
+Shannon_plot_sesa <- ggplot(sesa, aes(x=GI.Section, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("E","P","G","S","C","L")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("GIT Section")+ylab("Shannon Diversity Index") + ggtitle("Semipalmated Sandpiper")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y=element_blank())+theme(axis.title=element_text(size=14, face="plain"))
+Shannon_plot_sesa
+
+ggarrange(Shannon_plot_dunl,Shannon_plot_sesa)
+
+```
+
+
+```{r alpha diversity stats}
+#gi tract section
+fit_gi_dunl <- aov(Shannon ~ gi.tract.section, data=dunl)
+summary(fit_gi_dunl)
+TukeyHSD(fit_gi_dunl)
+
+fit_gi_sesa <- aov(Shannon ~ gi.tract.section, data=sesa)
+summary(fit_gi_sesa)
+TukeyHSD(fit_gi_sesa)
+
+#sex
+fit_sex <- aov(Shannon ~ sex, data=dunl)
+TukeyHSD(fit_sex)
+
+#species
+fit_sp <- aov(Shannon ~ Species, data=richness)
+TukeyHSD(fit_sp)
+```
+
+
+
+```{r Ordinations}
+ps_dunl<-subset_samples(ps_gut, Species=="Dunlin")
+ps_sesa<-subset_samples(ps_gut, Species=="Semipalmated Sandpiper")
+
+ord.nmds.wunifrac <- ordinate(ps_gut, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac <- ordinate(ps_gut, method="NMDS", distance="uunifrac")
+ord.nmds.bray <- ordinate(ps_gut, method="NMDS", distance="bray")
+
+ord.nmds.wunifrac.dunl <- ordinate(ps_dunl, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac.dunl <- ordinate(ps_dunl, method="NMDS", distance="uunifrac")
+ord.nmds.bray.dunl <- ordinate(ps_dunl, method="NMDS", distance="bray")
+
+ord.nmds.wunifrac.sesa <- ordinate(ps_sesa, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac.sesa <- ordinate(ps_sesa, method="NMDS", distance="uunifrac")
+ord.nmds.bray.sesa <- ordinate(ps_sesa, method="NMDS", distance="bray")
+
+#all species all sections
+gut_section<- plot_ordination(ps_gut, ord.nmds.bray) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = gi.tract.section, shape=Species), size=4) + theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+gut_section
+
+#Dunlin all gut sections
+dunl_section<- plot_ordination(ps_dunl, ord.nmds.bray.dunl) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = gi.tract.section), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+dunl_section
+
+#sesa all gut sections
+sesa_section<- plot_ordination(ps_sesa, ord.nmds.uunifrac.sesa) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = gi.tract.section, shape=gi.tract.section), size=3)+ theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+sesa_section
+
+```
+
+```{r permanova}
+library(vegan)
+
+permanova<- adonis(distance(ps_gut, method="uunifrac")~Species+sex+GI.section, data=metadata)
+permanova
+
+dunl_metadata <- metadata[ which(richness$Species=='Dunlin'), ] #subset dunl metadata
+dunl_permanova<- adonis(distance(ps_dunl, method="bray")~sex+GI.section, data=dunl_metadata)
+
+sesa_metadata <- metadata[ which(richness$Species=='Semipalmated Sandpiper'), ] #subset sesa metadata
+sesa_permanova<- adonis(distance(ps_sesa, method="bray")~sex+GI.section, data=sesa_metadata)
+sesa_permanova
+```
+
+```{r betadiversity stats}
+library(betapart)
+library(vegan)
+
+ASV_table<- read.table(file="gut_ASV.csv", sep=",", header=TRUE, row.names = c(1))
+
+###betadisper
+dist<-vegdist(ASV_table, method="bray")
+group<- as.factor(metadata_richness$GI.Section)
+disp.gi = betadisper(dist, metadata_richness$GI.Section)
+permutest(disp.gi, pairwise=TRUE, permutations=1000)
+
+```
+
+
+```{r deseq2}
+library(DESeq2); packageVersion("DESeq2")
+GIdds = phyloseq_to_deseq2(ps_gut, ~ GI.Section)
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+geoMeans = apply(counts(GIdds), 1, gm_mean)
+GIdds = estimateSizeFactors(GIdds, geoMeans = geoMeans)
+GIdds = DESeq(GIdds, fitType="local")
+
+res = results(GIdds)
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.01
+sigtab = res[(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_gut)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+
+posigtab = sigtab[sigtab[, "log2FoldChange"] > 0, ]
+posigtab = posigtab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+```
+
+```{r differential abundance plots}
+library("ggplot2")
+library(ggpubr)
+library(phyloseq)
+theme_set(theme_bw())
+
+#### GIZZARD vs SMALL INTESTINE
+G_S<- results(GIdds, contrast=c("GI.Section","G","S"))
+G_S= G_S[order(G_S$padj, na.last=NA), ]
+alpha = 0.01
+G_Stab = G_S[(G_S$padj < alpha), ]
+G_Stab = cbind(as(G_Stab, "data.frame"), as(tax_table(ps_gut)[rownames(G_Stab), ], "matrix"))
+poG_Stab = G_Stab[G_Stab[, "log2FoldChange"] > 0, ]
+poG_Stab = poG_Stab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+G_S_x = tapply(G_Stab$log2FoldChange, G_Stab$Genus, function(G_S_x) max(G_S_x))
+G_S_x = sort(G_S_x, TRUE)
+G_Stab$Genus = factor(as.character(G_Stab$Genus), levels=names(G_S_x))
+
+G_S_plot<- ggplot(G_Stab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + 
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  theme(axis.text.x = element_text(hjust = 0, vjust=0.5, size=10), axis.text.y = element_text(size=11)) +
+  ggtitle("Gizzard vs. Small Intestine")#+ theme(legend.position = "none")
+G_S_plot_dunl
+
+
+### Proventriculus vs gizzard
+P_G<- results(GIdds, contrast=c("GI.Section","P","G"))
+P_G= P_G[order(P_G$padj, na.last=NA), ]
+alpha = 0.01
+P_Gtab = P_G[(P_G$padj < alpha), ]
+P_Gtab = cbind(as(P_Gtab, "data.frame"), as(tax_table(ps_gut)[rownames(P_Gtab), ], "matrix"))
+poP_Gtab = P_Gtab[P_Gtab[, "log2FoldChange"] > 0, ]
+poP_Gtab = poP_Gtab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+P_G_x = tapply(P_Gtab$log2FoldChange, P_Gtab$Genus, function(P_G_x) max(P_G_x))
+P_G_x = sort(P_G_x, TRUE)
+P_Gtab$Genus = factor(as.character(P_Gtab$Genus), levels=names(P_G_x))
+
+P_G_plot<- ggplot(P_Gtab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + 
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  theme(axis.text.x = element_text(hjust = 0, vjust=0.5, size=10), axis.text.y = element_text(size=11)) + 
+  ggtitle("Proventriculus vs. Gizzard")
+P_G_plot
+
+### ESOPHAGUS vs PROVENTRICULUS
+E_P<- results(GIdds, contrast=c("GI.Section","E","P"))
+E_P= E_P[order(E_P$padj, na.last=NA), ]
+alpha = 0.01
+E_Ptab = E_P[(E_P$padj < alpha), ]
+E_Ptab = cbind(as(E_Ptab, "data.frame"), as(tax_table(ps_gut)[rownames(E_Ptab), ], "matrix"))
+poE_Ptab = E_Ptab[E_Ptab[, "log2FoldChange"] > 0, ]
+poE_Ptab = poE_Ptab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+E_P_x = tapply(E_Ptab$log2FoldChange, E_Ptab$Genus, function(E_P_x) max(E_P_x))
+E_P_x = sort(E_P_x, TRUE)
+E_Ptab$Genus = factor(as.character(E_Ptab$Genus), levels=names(E_P_x))
+
+E_P_plot<- ggplot(E_Ptab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + 
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  theme(axis.text.x = element_text(hjust = 0, vjust=0.5, size=10), axis.text.y = element_text(size=11)) + 
+  ggtitle("Esophagus vs. Proventriculus")
+E_P_plot
+
+### SMALL INTESTINE vs CECA
+S_C<- results(GIdds, contrast=c("GI.Section","S","C"))
+S_C= S_C[order(S_C$padj, na.last=NA), ]
+alpha = 0.01
+S_Ctab = S_C[(S_C$padj < alpha), ]
+S_Ctab = cbind(as(S_Ctab, "data.frame"), as(tax_table(ps_gut)[rownames(S_Ctab), ], "matrix"))
+poS_Ctab = S_Ctab[S_Ctab[, "log2FoldChange"] > 0, ]
+poS_Ctab = poS_Ctab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+S_C_x = tapply(S_Ctab$log2FoldChange, S_Ctab$Genus, function(S_C_x) max(S_C_x))
+S_C_x = sort(S_C_x, TRUE)
+S_Ctab$Genus = factor(as.character(S_Ctab$Genus), levels=names(S_C_x))
+
+S_C_plot<- ggplot(S_Ctab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + 
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  theme(axis.text.x = element_text(hjust = 0, vjust=0.5, size=10), axis.text.y = element_text(size=10))+ 
+  ggtitle("Small Intestine vs. Ceca")
+S_C_plot
+
+### CECA vs Colon
+C_L<- results(GIdds, contrast=c("GI.Section","C","L"))
+C_L= C_L[order(C_L$padj, na.last=NA), ]
+alpha = 0.01
+C_Ltab = C_L[(C_L$padj < alpha), ]
+C_Ltab = cbind(as(C_Ltab, "data.frame"), as(tax_table(ps_gut)[rownames(C_Ltab), ], "matrix"))
+poC_Ltab = C_Ltab[C_Ltab[, "log2FoldChange"] > 0, ]
+poC_Ltab = poC_Ltab[, c("baseMean", "log2FoldChange", "lfcSE", "padj", "Phylum", "Class", "Family", "Genus")]
+
+C_L_x = tapply(C_Ltab$log2FoldChange, C_Ltab$Genus, function(C_L_x) max(C_L_x))
+C_L_x = sort(C_L_x, TRUE)
+C_Ltab$Genus = factor(as.character(C_Ltab$Genus), levels=names(C_L_x))
+
+C_L_plot<- ggplot(C_Ltab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + 
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  theme(axis.text.x = element_text(hjust = 0, vjust=0.5, size=10), axis.text.y = element_text(size=11))+ 
+  ggtitle("Ceca vs. Colon")
+C_L_plot
+
+```
+
+```{r UpSetR}
+#devtools::install_github("hms-dbmi/UpSetR")
+library(UpSetR)
+library(ggplot2)
+library(grid)
+library(plyr)
+
+
+phylum_table <- read.table( file="Phylum_Dunlin_upsetr.csv", header=T, sep="," )
+genus_table <- read.table( file="Genus_upsetr.csv", header=T, sep="," )
+genus_table_dunl <- read.table( file="Genus_dunl_UpSetR.csv", header=T, sep="," )
+genus_table_sesa <- read.table( file="Genus_sesa_UpSetR.csv", header=T, sep="," )
+
+#plot both species
+hist<- upset(genus_table, nsets = 6, number.angles = 0, point.size = 2.7, line.size = 0, color = "black",
+    mainbar.y.label = "Number of Genera", text.scale = c(1.2, 1, 1, 1, 1.2, 1.2), sets.x.label = "Total genera",
+    order.by = "freq", sets = c("Colon", "Ceca", "Small_Intestine", "Gizzard", "Proventriculus", "Esophagus"),
+    keep.order = TRUE, queries = list(list(query = intersects, params = list("Gizzard", "Proventriculus","Esophagus"), color = "black", active = T), list(query = intersects, 
+    params = list("Ceca", "Colon"), color = "black", active = T)))
+hist
+
+#plot DUNLIN
+hist_dunl<- upset(genus_table_dunl, nsets = 6, number.angles = 0, point.size = 2.7, line.size = 0.3, color = "black",
+    mainbar.y.label = "Number of Genera", text.scale = c(1.2, 1, 1, 1, 1.2, 1.2), sets.x.label = "Total genera",
+    order.by = "freq", sets = c("Colon", "Ceca", "Small_Intestine", "Gizzard", "Proventriculus", "Esophagus"),keep.order = TRUE)
+hist_dunl
+
+#plot SESA
+hist_sesa<- upset(genus_table_sesa, nsets = 6, number.angles = 0, point.size = 2.7, line.size = 0.3, color = "black",
+    mainbar.y.label = "Number of Genera", text.scale = c(1.2, 1, 1, 1, 1.2, 1.2), sets.x.label = "Total genera",
+    order.by = "freq", sets = c("Colon", "Ceca", "Small_Intestine", "Gizzard", "Proventriculus", "Esophagus"),keep.order = TRUE)
+hist_sesa
+```
+
+```{r Random Forest}
+library("randomForest")
+library("plyr") # for the "arrange" function
+library("rfUtilities") # to test model significance
+library("caret") # to get leave-one-out cross-validation accuracies and also contains the nearZeroVar function 
+
+OTU1 = as(otu_table(ps_gut), "matrix")
+# transpose if necessary
+if(taxa_are_rows(ps_gut)){OTU1 <- t(OTU1)}
+# Coerce to data.frame
+OTUdf = as.data.frame(OTU1)
+write.csv(OTUdf, file='ASV_dunl_sesa.csv')
+
+otu_table <- t(read.table("ASV_dunl_sesa.csv", sep=",", header=T, row.names=1, stringsAsFactors=FALSE, comment.char=""))  
+metadata_RF<- read.table("metadata_RF.csv", sep=",", header=T, row.names=1, stringsAsFactors=FALSE, comment.char="")  
+
+metadata_RF$Species<-as.factor(metadata_RF$Species)
+metadata_RF$GI.Section<-as.factor(metadata_RF$GI.Section)
+
+
+#remove rare OTUs
+remove_rare <- function( table , cutoff_pro ) {
+  row2keep <- c()
+  cutoff <- ceiling( cutoff_pro * ncol(table) )  
+  for ( i in 1:nrow(table) ) {
+    row_nonzero <- length( which( table[ i , ]  > 0 ) ) 
+    if ( row_nonzero > cutoff ) {
+      row2keep <- c( row2keep , i)
+    }
+  }
+  return( table [ row2keep , , drop=F ])
+}
+otu_table_rare_removed <- remove_rare(table=otu_table, cutoff_pro=0.05)
+otu_table_rare_removed_norm <- sweep(otu_table_rare_removed, 2, colSums(otu_table_rare_removed) , '/')*100 #normalize data
+otu_table_scaled <- scale(otu_table_rare_removed_norm, center = TRUE, scale = TRUE)  #Z transformation
+#otu_table_scaled <- scale( asinh(otu_table), center=TRUE, scale=FALSE)  #take the inverse hyperbolic sine and then to mean center by sample
+
+otu_table_scaled_Species <- data.frame(t(otu_table_scaled)) #prep input tables for classification of Species
+otu_table_scaled_Species$Species <- metadata[rownames(otu_table_scaled_Species), "Species"] 
+otu_table_scaled_GI <- data.frame(t(otu_table_scaled)) #prep input tables for regression of GI section 
+otu_table_scaled_GI$GI.Section <- metadata[rownames(otu_table_scaled_GI), "GI.Section"] 
+
+set.seed(151)  
+RF_Species_classify <- randomForest( x=otu_table_scaled_Species[,1:(ncol(otu_table_scaled_Species)-1)] , y=otu_table_scaled_Species[ , ncol(otu_table_scaled_Species)] , ntree=10000, importance=TRUE, proximities=TRUE ) #classify species
+
+RF_GI_regress <- randomForest( x=otu_table_scaled_GI[,1:(ncol(otu_table_scaled_GI)-1)] , y=otu_table_scaled_GI[ , ncol(otu_table_scaled_GI)] , ntree=10000, importance=TRUE, proximities=TRUE ) #regress OTUs against GI
+
+RF_Species_classify_sig <- rf.significance( x=RF_Species_classify ,  xdata=otu_table_scaled_Species[,1:(ncol(otu_table_scaled_Species)-1)] , nperm=100 , ntree=10000 )  
+RF_GI_regress_sig <- rf.significance( x=RF_GI_regress,  xdata=otu_table_scaled_GI[,1:(ncol(otu_table_scaled_GI)-1)] , nperm=100 , ntree=501 )  
+
+#cross-validation
+fit_control <- trainControl( method = "LOOCV" ) 
+
+RF_Species_classify_loocv <- train( otu_table_scaled_Species[,1:(ncol(otu_table_scaled_Species)-1)] , y=otu_table_scaled_Species[, ncol(otu_table_scaled_Species)] , method="rf", ntree=501 , tuneGrid=data.frame( mtry=25 ) , trControl=fit_control )
+RF_Species_classify_loocv$results 
+
+RF_GI_regress_loocv <- train( otu_table_scaled_GI[,1:(ncol(otu_table_scaled_GI)-1)] , y=otu_table_scaled_GI[, ncol(otu_table_scaled_GI)] , method="rf", ntree=501 , tuneGrid=data.frame( mtry=215 ) , trControl=fit_control )
+
+RF_GI_regress_loocv$results  
+
+
+```
+
+
+```{r Bacteroidetes plots}
+bact_class_sesa<-read.table(file="Bacteroidetes_Class_sesa_relAb.csv", sep=",", header=TRUE)
+bact_class_dunl<-read.table(file="Bacteroidetes_Class_dunl.csv", sep=",", header=TRUE)
+
+bact_class_dunl$Section=factor(c("L", "C", "S", "G", "P", "E"), levels=c("L", "C", "S", "G", "P", "E"))
+bact_class_sesa$Section=factor(c("L", "C", "S", "G", "P", "E"), levels=c("L", "C", "S", "G", "P", "E"))
+
+#dunl
+bact_dunl<- ggplot(bact_class_dunl, aes(x=Section, y=Abundance, group=Class, color=Class, shape=Class)) +geom_line() +geom_point(size=2.5)+geom_errorbar(aes(ymin=Abundance-SE, ymax=Abundance+SE), width=.2,
+position=position_dodge(0.05))+labs(x="GI Tract Section", y = "Relative Abundance")+
+                theme_classic()+scale_color_manual(values=c('blue','red', 'darkgrey', 'green','black'))+theme(text = element_text(size=13))+ coord_flip()
+print(bact_dunl)
+
+#sesa
+bact_sesa<- ggplot(bact_class_sesa, aes(x=Section, y=Abundance, group=Class, color=Class, shape=Class)) +geom_line() +geom_point(size=2.5)+geom_errorbar(aes(ymin=Abundance-SE, ymax=Abundance+SE), width=.5, position=position_dodge(0.05))+labs(x="GI Tract Section", y = "Relative Abundance")+ theme_classic()+scale_color_manual(values=c('blue','red', 'darkgrey', 'green','black'))+theme(text = element_text(size=13))+ coord_flip()
+              
+```
+
+```{r Deferribacteres plots}
+def_class_sesa<-read.table(file="Deferribacteres_Class_sesa_relAb.csv", sep=",", header=TRUE)
+def_class_dunl<-read.table(file="Deferribacteres_Class_dunl.csv", sep=",", header=TRUE)
+
+def_class_dunl$Section=factor(c("L", "C", "S", "G", "P", "E"), levels=c("L", "C", "S", "G", "P", "E"))
+def_class_sesa$Section=factor(c("L", "C", "S", "G", "P", "E"), levels=c("L", "C", "S", "G", "P", "E"))
+
+#dunl
+def_dunl<- ggplot(def_class_dunl, aes(x=Section, y=Abundance, group=Class, color=Class, shape=Class)) +geom_line() +geom_point(size=2.5)+geom_errorbar(aes(ymin=Abundance-SE, ymax=Abundance+SE), width=.2,
+position=position_dodge(0.05))+labs(x="GI Tract Section", y = "Relative Abundance")+
+                theme_classic()+scale_color_manual(values=c('blue','red', 'darkgrey', 'green','black'))+theme(text = element_text(size=13))+ coord_flip()
+print(def_dunl)
+
+#sesa
+def_sesa<- ggplot(def_class_sesa, aes(x=Section, y=Abundance, group=Class, color=Class, shape=Class)) +geom_line() +geom_point(size=2.5)+geom_errorbar(aes(ymin=Abundance-SE, ymax=Abundance+SE), width=.5, position=position_dodge(0.05))+labs(x="GI Tract Section", y = "Relative Abundance")+ theme_classic()+scale_color_manual(values=c('blue','red', 'darkgrey', 'green','black'))+theme(text = element_text(size=13))+ coord_flip()
+
+```
